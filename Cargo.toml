@@ -1,0 +1,16 @@
+[package]
+name = "unpack_methode"
+version = "0.1.0"
+edition = "2024"
+repository = ""
+readme = "README.md"
+keywords = []
+description = ""
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-error = "1.0.4"
+itertools = "0.14.0"
