@@ -3,7 +3,7 @@ extern crate proc_macro;
 
 use std::{fs, process::Command, str::FromStr};
 
-use itertools::{Group, Itertools};
+use itertools::Itertools;
 use map_tuple::*;
 use proc_macro::{Delimiter, TokenStream, TokenTree};
 use proc_macro_error::{emit_call_site_error, proc_macro_error};
@@ -176,12 +176,15 @@ pub fn unpack(key: TokenStream, item: TokenStream) -> TokenStream {
             (key, typ)
         })
         .collect::<Vec<_>>();
+    if debug {
+        dbg!(&lines);
+    }
 
     let body_text_ref = &body_text; 
-    let (new_body, new_fields) = body_text.match_indices("self.")
+    let (new_body, (unpacking_usefull, new_fields)) = body_text.match_indices("self.")
         .map(|(i, _)| i + 5)
         .map(|start| {
-            let (end, char) = body_text[start..].match_indices([' ', '\n', '.', ';', '(', ')', '[', ']', '{', '}',  '=' ])
+            let (end, char) = body_text[start..].match_indices([' ', '\n', '.', ';', ',', '(', ')', '[', ']', '{', '}',  '=' ])
                 .next()
                 .expect("self. did not end!");
             let end = end + start;
@@ -212,7 +215,26 @@ pub fn unpack(key: TokenStream, item: TokenStream) -> TokenStream {
                 (start, end, add_deref)
             })
             .fold(("".to_string(), 0), |(mut text, last), (start, end, add_deref)| {
-                text.push_str(&body_text[last..start].replace("self.", ""));
+                let mut body_end = start - 5;
+                body_end -= body_text[last..body_end].chars()
+                    .rev()
+                    .take_while(|c| *c == ' ')
+                    .count();
+
+                if body_end >= 3 && &body_text[(body_end - 3)..body_end] == "mut" {
+                    body_end -= 3;
+                }
+
+                body_end -= body_text[last..body_end].chars()
+                    .rev()
+                    .take_while(|c| *c == ' ')
+                    .count();
+
+                if body_end >= 1 && &body_text[(body_end - 1)..body_end] == "&" {
+                    body_end -= 1;
+                }
+
+                text.push_str(&body_text[last..body_end]);
 
                 if add_deref {
                     text.push_str("*(");
@@ -240,22 +262,33 @@ pub fn unpack(key: TokenStream, item: TokenStream) -> TokenStream {
 
                 lines
             }).into_iter()
-            .filter(|(b, _)| *b)
-            .fold("".to_string(), |parameters, (_, (key, typ))| {
-                if !typ.contains("&") {
-                    format!("{key}: {pre_self} {typ}, {parameters}")
-                } else {
-                    format!("{key}: {typ}, {parameters}")
-                }
-            })); 
+            .tee()
+            .map0(|mut x| !x.all(|(b, _)| b))
+            .map1(|x|x
+                .filter(|(b, _)| *b)
+                .fold("".to_string(), |parameters, (_, (key, typ))| {
+                    if !typ.contains("&") {
+                        format!("{key}: {pre_self} {typ}, {parameters}")
+                    } else {
+                        format!("{key}: {typ}, {parameters}")
+                    }
+            }))); 
 
     let final_text = format!("{}\n\n{header_text}({new_fields}{parameter_text})\n{new_body}", item.to_string());
     
     if debug {
         println!("   > Unpacked Debug: \n {final_text}\n");
+        
+        if !unpacking_usefull {
+            println!("[WARN] All fields are used in function. Unpacking does not help.")
+        }
 
     } else if !silent {
         println!("   > Unpacked {header_text}({new_fields}...)");
+
+        if !unpacking_usefull {
+            println!("[WARN] All fields are used in function. Unpacking does not help.")
+        }
     }
     
     proc_macro::TokenStream::from_str(&final_text).unwrap()
