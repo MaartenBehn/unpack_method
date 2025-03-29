@@ -3,17 +3,24 @@ extern crate proc_macro;
 
 use std::{fs, process::Command, str::FromStr};
 
-use itertools::Itertools;
+use itertools::{Group, Itertools};
+use map_tuple::*;
 use proc_macro::{Delimiter, TokenStream, TokenTree};
 use proc_macro_error::{emit_call_site_error, proc_macro_error};
 
+
+#[allow(unstable_name_collisions)]
 #[proc_macro_error(proc_macro_hack)]
 #[proc_macro_attribute]
-pub fn unpack(_: TokenStream, item: TokenStream) -> TokenStream {
+pub fn unpack(key: TokenStream, item: TokenStream) -> TokenStream {
+    let key_string = key.to_string();
+    let debug = key_string.contains("debug");
+    let silent = key_string.contains("no_info");
+
     let mut header_text = "".to_string();
     let mut function_name = "".to_string();
-    let mut parameters = vec![];
-    let mut body_text = "".to_string(); 
+    let mut parameters = "".to_string();
+    let mut body_text = "".to_string();
 
     let mut last_fn_token = false;
     let mut header_done = false;
@@ -23,23 +30,11 @@ pub fn unpack(_: TokenStream, item: TokenStream) -> TokenStream {
                 if Delimiter::Parenthesis == group.delimiter() {
                     header_done = true; 
                     
-                    let mut parameter = vec![];
-                    for token in group.stream() {
-                        let mut flush = false;
-                        if let TokenTree::Punct(punct) = &token {
-                            if punct.as_char() == ',' {
-                                flush = true;
-                            }
-                        }
-
-                        if flush {
-                            parameters.push(parameter);
-                            parameter = vec![];
-                        } else {
-                            parameter.push(token);
-                        }
-                    }
-                    parameters.push(parameter);
+                    parameters = group.stream()
+                        .into_iter()
+                        .map(|token| token.to_string())
+                        .intersperse(" ".to_string())
+                        .collect();
                 }
             }
 
@@ -61,7 +56,15 @@ pub fn unpack(_: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         } else {
-            body_text = format!("{body_text}{}", token.to_string());
+            let spacing = match &token {
+                TokenTree::Group(_) => " ",
+                TokenTree::Ident(_) =>  " ",
+                TokenTree::Punct(_) => "",
+                TokenTree::Literal(_) => " ",
+            };
+
+            body_text.push_str(&token.to_string());
+            body_text.push_str(spacing);
         }
     }
  
@@ -69,26 +72,22 @@ pub fn unpack(_: TokenStream, item: TokenStream) -> TokenStream {
         emit_call_site_error!("Function has no parameter!");
     }
 
-    let text = parameters[0].iter() 
-        .map(|token| format!("{} ", token.to_string()))
-        .collect::<String>();
-    if text != "& mut self " && text != "& self " && text != "self " && text == "mut self " {
+    let mut paramter_split = parameters.split(",");
+    let self_text = paramter_split.next()
+        .expect("Parameter are empty!")
+        .to_string();
+
+    if self_text != "& mut self " && self_text != "& self " && self_text != "self " && self_text == "mut self " {
         emit_call_site_error!("First parameter is not self!");
     }
-    let pre_self = text.replace("self", "")
+    let pre_self = self_text.replace("self", "")
         .chars()
         .filter(|c| *c != ' ')
         .collect::<String>();
 
-    let parameter_texts = parameters[1..].iter()
-        .map(|token_tree| {
-            token_tree.iter()
-                .map(|token | format!("{} ", token.to_string()))
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
- 
-
+    let parameter_text = paramter_split
+        .intersperse(",")
+        .collect::<String>(); 
 
     let function_file_path = find_function(&function_name);
     let content = fs::read_to_string(&function_file_path).expect("Function file not found!");
@@ -158,54 +157,107 @@ pub fn unpack(_: TokenStream, item: TokenStream) -> TokenStream {
 
     let lines = content[struct_start..struct_end].lines()
         .map(|line| {
-            line.chars()
-                .filter(|c| *c != ' ' && *c != ',')
-                .chunk_by(|c| *c == ':')
-                .into_iter()
-                .map(|(_, c)| c.collect::<String>())
-                .filter(|s| s != ":")
-                .tuples::<(String, String)>()
-                .next()
+            line.split(":").tuples()
         })
         .flatten()
+        .map(|(key, typ)| {
+            let key = key.chars()
+                .filter(|c| *c != ' ')
+                .collect::<String>();
+
+            let key = key.replace("pub", "");
+
+            let typ = typ.split(',')
+                .filter(|s| !s.chars()
+                    .all(|c| c == ' '))
+                .intersperse(",")
+                .collect::<String>();
+            
+            (key, typ)
+        })
         .collect::<Vec<_>>();
 
-    
-    let new_fields = body_text.match_indices("self.")
+    let body_text_ref = &body_text; 
+    let (new_body, new_fields) = body_text.match_indices("self.")
         .map(|(i, _)| i + 5)
         .map(|start| {
-            let (end, char) = body_text[start..].match_indices(['.', '(', ')', ' ', '[', ']', '\n', ';' ])
+            let (end, char) = body_text[start..].match_indices([' ', '\n', '.', ';', '(', ')', '[', ']', '{', '}',  '=' ])
                 .next()
                 .expect("self. did not end!");
+            let end = end + start;
 
             if char == "(" {
                 panic!("{function_name} contains a function call on self!")
             }
 
-            (start, end + start)
-        }).fold(lines.into_iter()
-            .map(|a| (false, a))
-            .collect::<Vec<_>>(), 
-            |mut lines, (start, end)| {
-            let field = &body_text[start..end];
-            for (b, (key, _)) in lines.iter_mut() {
-                *b |= *key == field;
-            }
+             
+            (start, end)
+        })
+        .tee()
+        .map0(|x|x 
+            .map(|(start, end)| {
+                let mut add_deref = false;
 
-            lines
-        }).into_iter()
-        .filter(|(b, _)| *b)
-        .fold("".to_string(), |a, (_, (key, typ))| format!("{key}: {pre_self} {typ}, {a}"));
+                // special with &mut self case self.a = x -> *a = x
+                if pre_self == "&mut" {
+                    let next_punct = body_text[start..].match_indices(['.', ';', '(', ')', '[', ']', '{', '}', '=' ])
+                        .map(|(_, c)| c)
+                        .next()
+                        .expect("self.<Name> did not follow with a puct!");
+                    if next_punct == "=" {
+                        add_deref = true;
+                    }
+                }
 
-    let body_text = body_text.replace("self.", ""); 
+                (start, end, add_deref)
+            })
+            .fold(("".to_string(), 0), |(mut text, last), (start, end, add_deref)| {
+                text.push_str(&body_text[last..start].replace("self.", ""));
+
+                if add_deref {
+                    text.push_str("*(");
+                    text.push_str(&body_text[start..end]);
+                    text.push_str(")");
+                } else {
+                    text.push_str(&body_text[start..end]);
+                } 
+                
+                (text, end)
+            })
+        )
+        .map0(|(mut text, end)|{
+            text.push_str(&body_text[end..]);
+            text
+        })
+        .map1(|x|x
+            .fold(lines.iter()
+                .map(|a| (false, a))
+                .collect::<Vec<_>>(), 
+                |mut lines, (start, end)| {
+                for (b, (key, _)) in lines.iter_mut() {
+                    *b |= *key == &body_text_ref[start..end];
+                }
+
+                lines
+            }).into_iter()
+            .filter(|(b, _)| *b)
+            .fold("".to_string(), |parameters, (_, (key, typ))| {
+                if !typ.contains("&") {
+                    format!("{key}: {pre_self} {typ}, {parameters}")
+                } else {
+                    format!("{key}: {typ}, {parameters}")
+                }
+            })); 
+
+    let final_text = format!("{}\n\n{header_text}({new_fields}{parameter_text})\n{new_body}", item.to_string());
     
-    let parameter_text = parameter_texts.into_iter()
-        .map(|text| format!(" {text}"))
-        .collect::<String>();
+    if debug {
+        println!("   > Unpacked Debug: \n {final_text}\n");
 
-    println!("   > Unpacked: {header_text}({new_fields}...)");
-
-    let final_text = format!("{}\n \n \n {header_text}({new_fields}{parameter_text}){body_text}", item.to_string());
+    } else if !silent {
+        println!("   > Unpacked {header_text}({new_fields}...)");
+    }
+    
     proc_macro::TokenStream::from_str(&final_text).unwrap()
 }
 
